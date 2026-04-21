@@ -1,108 +1,92 @@
 import os
+import asyncio
 import logging
 import ipaddress
 import httpx
 from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# 1. Load configuration from specific env file
+# 1. Load config
 load_dotenv("config.env")
 
-# 2. Setup Logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
-    level=logging.INFO
-)
+# 2. Flask Heartbeat (To keep Render happy)
+server = Flask('')
+@server.route('/')
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    # Render provides the PORT env var; default to 8080
+    port = int(os.environ.get("PORT", 8080))
+    server.run(host='0.0.0.0', port=port)
+
+def keep_alive():
+    t = Thread(target=run_flask)
+    t.daemon = True # Ensure thread dies when main script dies
+    t.start()
+
+# 3. Setup Logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# 3. Environment Variables
+# 4. Env Variables
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 _raw_users = os.getenv("ALLOWED_USER_IDS", "")
 ALLOWED_USERS = {int(i.strip()) for i in _raw_users.split(",") if i.strip().isdigit()}
-
 CF_TOKEN = os.getenv("CF_API_TOKEN")
 CF_ZONE = os.getenv("CF_ZONE_ID")
-# Dictionary mapping for easy iteration
 DNS_RECORDS = {
     "Record 1": os.getenv("CF_RECORD_ID_1"),
     "Record 2": os.getenv("CF_RECORD_ID_2"),
 }
 
 async def update_dns(new_ip: str) -> list:
-    """Updates both DNS records in Cloudflare."""
     url_base = f"https://api.cloudflare.com/client/v4/zones/{CF_ZONE}/dns_records"
-    headers = {
-        "Authorization": f"Bearer {CF_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    
+    headers = {"Authorization": f"Bearer {CF_TOKEN}", "Content-Type": "application/json"}
     results = []
     async with httpx.AsyncClient() as client:
         for label, rec_id in DNS_RECORDS.items():
-            if not rec_id:
-                results.append(f"❌ {label}: Missing ID in config")
-                continue
-                
-            payload = {
-                "type": "A",
-                "content": new_ip,
-                "ttl": 1, # '1' means Automatic TTL
-                "proxied": False
-            }
-            
+            if not rec_id: continue
             try:
-                # Use PATCH or PUT; PATCH only updates specified fields
-                resp = await client.patch(f"{url_base}/{rec_id}", headers=headers, json=payload)
-                if resp.status_code == 200:
-                    results.append(f"✅ {label}: Updated")
-                else:
-                    results.append(f"❌ {label}: API Error ({resp.status_code})")
-            except Exception as e:
-                results.append(f"❌ {label}: Connection Error")
-                logger.error(f"DNS Update Error: {e}")
-                
+                resp = await client.patch(f"{url_base}/{rec_id}", headers=headers, 
+                                          json={"type": "A", "content": new_ip, "ttl": 1})
+                results.append(f"✅ {label}: Updated" if resp.status_code == 200 else f"❌ {label}: Failed")
+            except Exception:
+                results.append(f"❌ {label}: Error")
     return results
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main logic for processing messages."""
-    user_id = update.effective_user.id
-    
-    # Security: Verify User
-    if user_id not in ALLOWED_USERS:
-        logger.warning(f"Unauthorized access attempt by ID: {user_id}")
+    if update.effective_user.id not in ALLOWED_USERS:
         return
-
     text = update.message.text.strip()
-    
-    # Validation: Verify IP Format
     try:
         ipaddress.ip_address(text)
+        status_msg = await update.message.reply_text("🔄 Updating DNS...")
+        results = await update_dns(text)
+        await status_msg.edit_text(f"Report for {text}:\n" + "\n".join(results))
     except ValueError:
-        await update.message.reply_text("Invalid input. Please send a valid IPv4 address.")
-        return
-
-    # Action
-    status_msg = await update.message.reply_text("🔄 Processing DNS update...")
-    update_results = await update_dns(text)
-    
-    # Final Response
-    response_text = "\n".join(update_results)
-    await status_msg.edit_text(f"Update Report for {text}:\n\n{response_text}")
+        await update.message.reply_text("Invalid IP format.")
 
 def main():
-    if not TOKEN or not CF_TOKEN:
-        print("Error: Missing critical tokens in config.env")
+    if not TOKEN:
+        print("Missing TELEGRAM_BOT_TOKEN")
         return
 
-    # Create the application
-    app = Application.builder().token(TOKEN).build()
+    # Start the Flask web server in a background thread
+    keep_alive()
 
-    # Handle all text messages (that aren't commands)
+    # Build the bot
+    app = Application.builder().token(TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Bot is starting...")
-    app.run_polling()
+    
+    # run_polling() is the standard way, but we must ensure 
+    # it's called correctly in the MainThread
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
     main()
